@@ -54,15 +54,174 @@ MultipartFormData &get_file_value(MultipartFormDataItems &files,
 #endif
 }
 
+#ifndef _WIN32
+class UnixSocketTest : public ::testing::Test {
+protected:
+  void TearDown() override { std::remove(pathname_.c_str()); }
+
+  void client_GET(const std::string &addr) {
+    httplib::Client cli{addr};
+    cli.set_address_family(AF_UNIX);
+    ASSERT_TRUE(cli.is_valid());
+
+    const auto &result = cli.Get(pattern_);
+    ASSERT_TRUE(result) << "error: " << result.error();
+
+    const auto &resp = result.value();
+    EXPECT_EQ(resp.status, StatusCode::OK_200);
+    EXPECT_EQ(resp.body, content_);
+  }
+
+  const std::string pathname_{"./httplib-server.sock"};
+  const std::string pattern_{"/hi"};
+  const std::string content_{"Hello World!"};
+};
+
+TEST_F(UnixSocketTest, pathname) {
+  httplib::Server svr;
+  svr.Get(pattern_, [&](const httplib::Request &, httplib::Response &res) {
+    res.set_content(content_, "text/plain");
+  });
+
+  std::thread t{[&] {
+    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(pathname_, 80));
+  }};
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+  ASSERT_TRUE(svr.is_running());
+
+  client_GET(pathname_);
+}
+
+#if defined(__linux__) ||                                                      \
+    /* __APPLE__ */ (defined(SOL_LOCAL) && defined(SO_PEERPID))
+TEST_F(UnixSocketTest, PeerPid) {
+  httplib::Server svr;
+  std::string remote_port_val;
+  svr.Get(pattern_, [&](const httplib::Request &req, httplib::Response &res) {
+    res.set_content(content_, "text/plain");
+    remote_port_val = req.get_header_value("REMOTE_PORT");
+  });
+
+  std::thread t{[&] {
+    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(pathname_, 80));
+  }};
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+  ASSERT_TRUE(svr.is_running());
+
+  client_GET(pathname_);
+  EXPECT_EQ(std::to_string(getpid()), remote_port_val);
+}
+#endif
+
+#ifdef __linux__
+TEST_F(UnixSocketTest, abstract) {
+  constexpr char svr_path[]{"\x00httplib-server.sock"};
+  const std::string abstract_addr{svr_path, sizeof(svr_path) - 1};
+
+  httplib::Server svr;
+  svr.Get(pattern_, [&](const httplib::Request &, httplib::Response &res) {
+    res.set_content(content_, "text/plain");
+  });
+
+  std::thread t{[&] {
+    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(abstract_addr, 80));
+  }};
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+  ASSERT_TRUE(svr.is_running());
+
+  client_GET(abstract_addr);
+}
+#endif
+
+TEST(SocketStream, is_writable_UNIX) {
+  int fds[2];
+  ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+  const auto asSocketStream = [&](socket_t fd,
+                                  std::function<bool(Stream &)> func) {
+    return detail::process_client_socket(fd, 0, 0, 0, 0, func);
+  };
+  asSocketStream(fds[0], [&](Stream &s0) {
+    EXPECT_EQ(s0.socket(), fds[0]);
+    EXPECT_TRUE(s0.is_writable());
+
+    EXPECT_EQ(0, close(fds[1]));
+    EXPECT_FALSE(s0.is_writable());
+
+    return true;
+  });
+  EXPECT_EQ(0, close(fds[0]));
+}
+
+TEST(SocketStream, is_writable_INET) {
+  sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(PORT + 1);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  int disconnected_svr_sock = -1;
+  std::thread svr{[&] {
+    const int s = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_LE(0, s);
+    ASSERT_EQ(0, ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+    ASSERT_EQ(0, listen(s, 1));
+    ASSERT_LE(0, disconnected_svr_sock = accept(s, nullptr, nullptr));
+    ASSERT_EQ(0, close(s));
+  }};
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  std::thread cli{[&] {
+    const int s = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_LE(0, s);
+    ASSERT_EQ(0, connect(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+    ASSERT_EQ(0, close(s));
+  }};
+  cli.join();
+  svr.join();
+  ASSERT_NE(disconnected_svr_sock, -1);
+
+  const auto asSocketStream = [&](socket_t fd,
+                                  std::function<bool(Stream &)> func) {
+    return detail::process_client_socket(fd, 0, 0, 0, 0, func);
+  };
+  asSocketStream(disconnected_svr_sock, [&](Stream &ss) {
+    EXPECT_EQ(ss.socket(), disconnected_svr_sock);
+    EXPECT_FALSE(ss.is_writable());
+
+    return true;
+  });
+
+  ASSERT_EQ(0, close(disconnected_svr_sock));
+}
+#endif // #ifndef _WIN32
+
 TEST(ClientTest, MoveConstructible) {
   EXPECT_FALSE(std::is_copy_constructible<Client>::value);
   EXPECT_TRUE(std::is_nothrow_move_constructible<Client>::value);
 }
 
-TEST(ClientTest, MoveAssignable)
-{
-    EXPECT_FALSE(std::is_copy_assignable<Client>::value);
-    EXPECT_TRUE(std::is_nothrow_move_assignable<Client>::value);
+TEST(ClientTest, MoveAssignable) {
+  EXPECT_FALSE(std::is_copy_assignable<Client>::value);
+  EXPECT_TRUE(std::is_nothrow_move_assignable<Client>::value);
 }
 
 #ifdef _WIN32
@@ -1755,32 +1914,34 @@ TEST(BindServerTest, BindAndListenSeparatelySSLEncryptedKey) {
 #endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-X509* readCertificate (const std::string& strFileName) {
-    std::ifstream inStream (strFileName);
-    std::string strCertPEM ((std::istreambuf_iterator<char>(inStream)), std::istreambuf_iterator<char>());
+X509 *readCertificate(const std::string &strFileName) {
+  std::ifstream inStream(strFileName);
+  std::string strCertPEM((std::istreambuf_iterator<char>(inStream)),
+                         std::istreambuf_iterator<char>());
 
-    if (strCertPEM.empty ()) return (nullptr);
+  if (strCertPEM.empty()) return (nullptr);
 
-    BIO* pbCert = BIO_new (BIO_s_mem ());
-    BIO_write (pbCert, strCertPEM.c_str (), (int)strCertPEM.size ());
-    X509* pCert = PEM_read_bio_X509 (pbCert, NULL, 0, NULL);
-    BIO_free (pbCert);
+  BIO *pbCert = BIO_new(BIO_s_mem());
+  BIO_write(pbCert, strCertPEM.c_str(), (int)strCertPEM.size());
+  X509 *pCert = PEM_read_bio_X509(pbCert, NULL, 0, NULL);
+  BIO_free(pbCert);
 
-    return (pCert);
+  return (pCert);
 }
 
-EVP_PKEY* readPrivateKey (const std::string& strFileName) {
-    std::ifstream inStream (strFileName);
-    std::string strPrivateKeyPEM ((std::istreambuf_iterator<char>(inStream)), std::istreambuf_iterator<char>());
+EVP_PKEY *readPrivateKey(const std::string &strFileName) {
+  std::ifstream inStream(strFileName);
+  std::string strPrivateKeyPEM((std::istreambuf_iterator<char>(inStream)),
+                               std::istreambuf_iterator<char>());
 
-    if (strPrivateKeyPEM.empty ()) return (nullptr);
+  if (strPrivateKeyPEM.empty()) return (nullptr);
 
-    BIO* pbPrivKey = BIO_new (BIO_s_mem ());
-    BIO_write (pbPrivKey, strPrivateKeyPEM.c_str (), (int) strPrivateKeyPEM.size ());
-    EVP_PKEY* pPrivateKey = PEM_read_bio_PrivateKey (pbPrivKey, NULL, NULL, NULL);
-    BIO_free (pbPrivKey);
+  BIO *pbPrivKey = BIO_new(BIO_s_mem());
+  BIO_write(pbPrivKey, strPrivateKeyPEM.c_str(), (int)strPrivateKeyPEM.size());
+  EVP_PKEY *pPrivateKey = PEM_read_bio_PrivateKey(pbPrivKey, NULL, NULL, NULL);
+  BIO_free(pbPrivKey);
 
-    return (pPrivateKey);
+  return (pPrivateKey);
 }
 
 TEST(BindServerTest, UpdateCerts) {
@@ -1789,26 +1950,26 @@ TEST(BindServerTest, UpdateCerts) {
   ASSERT_TRUE(svr.is_valid());
   ASSERT_TRUE(port > 0);
 
-  X509* cert    = readCertificate (SERVER_CERT_FILE);
-  X509* ca_cert = readCertificate (CLIENT_CA_CERT_FILE);
-  EVP_PKEY* key = readPrivateKey  (SERVER_PRIVATE_KEY_FILE);
+  X509 *cert = readCertificate(SERVER_CERT_FILE);
+  X509 *ca_cert = readCertificate(CLIENT_CA_CERT_FILE);
+  EVP_PKEY *key = readPrivateKey(SERVER_PRIVATE_KEY_FILE);
 
-  ASSERT_TRUE(cert    != nullptr);
+  ASSERT_TRUE(cert != nullptr);
   ASSERT_TRUE(ca_cert != nullptr);
-  ASSERT_TRUE(key     != nullptr);
+  ASSERT_TRUE(key != nullptr);
 
-  X509_STORE* cert_store = X509_STORE_new ();
+  X509_STORE *cert_store = X509_STORE_new();
 
-  X509_STORE_add_cert (cert_store, ca_cert);
+  X509_STORE_add_cert(cert_store, ca_cert);
 
-  svr.update_certs (cert, key, cert_store);
+  svr.update_certs(cert, key, cert_store);
 
   ASSERT_TRUE(svr.is_valid());
   svr.stop();
 
-  X509_free (cert);
-  X509_free (ca_cert);
-  EVP_PKEY_free (key);
+  X509_free(cert);
+  X509_free(ca_cert);
+  EVP_PKEY_free(key);
 }
 #endif
 
@@ -2357,8 +2518,8 @@ protected:
              })
         .Get("/with-range-customized-response",
              [&](const Request & /*req*/, Response &res) {
-              res.status = StatusCode::BadRequest_400;
-              res.set_content(JSON_DATA,  "application/json");
+               res.status = StatusCode::BadRequest_400;
+               res.set_content(JSON_DATA, "application/json");
              })
         .Post("/chunked",
               [&](const Request &req, Response & /*res*/) {
@@ -3480,8 +3641,10 @@ TEST_F(ServerTest, GetStreamedWithRangeError) {
 }
 
 TEST_F(ServerTest, GetRangeWithMaxLongLength) {
-  auto res =
-      cli_.Get("/with-range", {{"Range", "bytes=0-" + std::to_string(std::numeric_limits<long>::max())}});
+  auto res = cli_.Get(
+      "/with-range",
+      {{"Range",
+        "bytes=0-" + std::to_string(std::numeric_limits<long>::max())}});
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   EXPECT_EQ("0", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -3637,7 +3800,8 @@ TEST_F(ServerTest, GetWithRangeMultipartOffsetGreaterThanContent) {
 }
 
 TEST_F(ServerTest, GetWithRangeCustomizedResponse) {
-  auto res = cli_.Get("/with-range-customized-response", {{make_range_header({{1, 2}})}});
+  auto res = cli_.Get("/with-range-customized-response",
+                      {{make_range_header({{1, 2}})}});
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ(true, res->has_header("Content-Length"));
@@ -3646,7 +3810,8 @@ TEST_F(ServerTest, GetWithRangeCustomizedResponse) {
 }
 
 TEST_F(ServerTest, GetWithRangeMultipartCustomizedResponseMultipleRange) {
-  auto res = cli_.Get("/with-range-customized-response", {{make_range_header({{1, 2}, {4, 5}})}});
+  auto res = cli_.Get("/with-range-customized-response",
+                      {{make_range_header({{1, 2}, {4, 5}})}});
   ASSERT_TRUE(res);
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ(true, res->has_header("Content-Length"));
@@ -4990,6 +5155,63 @@ TEST(KeepAliveTest, SSLClientReconnection) {
   result = cli.Get("/hi");
   ASSERT_TRUE(result);
   EXPECT_EQ(StatusCode::OK_200, result->status);
+}
+
+TEST(KeepAliveTest, SSLClientReconnectionPost) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.set_keep_alive_timeout(1);
+  std::string content = "reconnect";
+
+  svr.Post("/hi", [](const httplib::Request &, httplib::Response &res) {
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto listen_thread = std::thread([&svr] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, PORT);
+  cli.enable_server_certificate_verification(false);
+  cli.set_keep_alive(true);
+
+  auto result = cli.Post(
+      "/hi", content.size(),
+      [&content](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        sink.write(content.c_str(), content.size());
+        return true;
+      },
+      "text/plain");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(200, result->status);
+
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  // Recoonect
+  result = cli.Post(
+      "/hi", content.size(),
+      [&content](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        sink.write(content.c_str(), content.size());
+        return true;
+      },
+      "text/plain");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(200, result->status);
+
+  result = cli.Post(
+      "/hi", content.size(),
+      [&content](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        sink.write(content.c_str(), content.size());
+        return true;
+      },
+      "text/plain");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(200, result->status);
 }
 #endif
 
@@ -6965,166 +7187,6 @@ TEST(MultipartFormDataTest, ContentLength) {
 
 #endif
 
-#ifndef _WIN32
-class UnixSocketTest : public ::testing::Test {
-protected:
-  void TearDown() override { std::remove(pathname_.c_str()); }
-
-  void client_GET(const std::string &addr) {
-    httplib::Client cli{addr};
-    cli.set_address_family(AF_UNIX);
-    ASSERT_TRUE(cli.is_valid());
-
-    const auto &result = cli.Get(pattern_);
-    ASSERT_TRUE(result) << "error: " << result.error();
-
-    const auto &resp = result.value();
-    EXPECT_EQ(resp.status, StatusCode::OK_200);
-    EXPECT_EQ(resp.body, content_);
-  }
-
-  const std::string pathname_{"./httplib-server.sock"};
-  const std::string pattern_{"/hi"};
-  const std::string content_{"Hello World!"};
-};
-
-TEST_F(UnixSocketTest, pathname) {
-  httplib::Server svr;
-  svr.Get(pattern_, [&](const httplib::Request &, httplib::Response &res) {
-    res.set_content(content_, "text/plain");
-  });
-
-  std::thread t{[&] {
-    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(pathname_, 80));
-  }};
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    t.join();
-    ASSERT_FALSE(svr.is_running());
-  });
-
-  svr.wait_until_ready();
-  ASSERT_TRUE(svr.is_running());
-
-  client_GET(pathname_);
-}
-
-#if defined(__linux__) ||                                                      \
-    /* __APPLE__ */ (defined(SOL_LOCAL) && defined(SO_PEERPID))
-TEST_F(UnixSocketTest, PeerPid) {
-  httplib::Server svr;
-  std::string remote_port_val;
-  svr.Get(pattern_, [&](const httplib::Request &req, httplib::Response &res) {
-    res.set_content(content_, "text/plain");
-    remote_port_val = req.get_header_value("REMOTE_PORT");
-  });
-
-  std::thread t{[&] {
-    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(pathname_, 80));
-  }};
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    t.join();
-    ASSERT_FALSE(svr.is_running());
-  });
-
-  svr.wait_until_ready();
-  ASSERT_TRUE(svr.is_running());
-
-  client_GET(pathname_);
-  EXPECT_EQ(std::to_string(getpid()), remote_port_val);
-}
-#endif
-
-#ifdef __linux__
-TEST_F(UnixSocketTest, abstract) {
-  constexpr char svr_path[]{"\x00httplib-server.sock"};
-  const std::string abstract_addr{svr_path, sizeof(svr_path) - 1};
-
-  httplib::Server svr;
-  svr.Get(pattern_, [&](const httplib::Request &, httplib::Response &res) {
-    res.set_content(content_, "text/plain");
-  });
-
-  std::thread t{[&] {
-    ASSERT_TRUE(svr.set_address_family(AF_UNIX).listen(abstract_addr, 80));
-  }};
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    t.join();
-    ASSERT_FALSE(svr.is_running());
-  });
-
-  svr.wait_until_ready();
-  ASSERT_TRUE(svr.is_running());
-
-  client_GET(abstract_addr);
-}
-#endif
-
-TEST(SocketStream, is_writable_UNIX) {
-  int fds[2];
-  ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
-
-  const auto asSocketStream = [&](socket_t fd,
-                                  std::function<bool(Stream &)> func) {
-    return detail::process_client_socket(fd, 0, 0, 0, 0, func);
-  };
-  asSocketStream(fds[0], [&](Stream &s0) {
-    EXPECT_EQ(s0.socket(), fds[0]);
-    EXPECT_TRUE(s0.is_writable());
-
-    EXPECT_EQ(0, close(fds[1]));
-    EXPECT_FALSE(s0.is_writable());
-
-    return true;
-  });
-  EXPECT_EQ(0, close(fds[0]));
-}
-
-TEST(SocketStream, is_writable_INET) {
-  sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(PORT + 1);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-  int disconnected_svr_sock = -1;
-  std::thread svr{[&] {
-    const int s = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_LE(0, s);
-    ASSERT_EQ(0, ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
-    ASSERT_EQ(0, listen(s, 1));
-    ASSERT_LE(0, disconnected_svr_sock = accept(s, nullptr, nullptr));
-    ASSERT_EQ(0, close(s));
-  }};
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  std::thread cli{[&] {
-    const int s = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_LE(0, s);
-    ASSERT_EQ(0, connect(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
-    ASSERT_EQ(0, close(s));
-  }};
-  cli.join();
-  svr.join();
-  ASSERT_NE(disconnected_svr_sock, -1);
-
-  const auto asSocketStream = [&](socket_t fd,
-                                  std::function<bool(Stream &)> func) {
-    return detail::process_client_socket(fd, 0, 0, 0, 0, func);
-  };
-  asSocketStream(disconnected_svr_sock, [&](Stream &ss) {
-    EXPECT_EQ(ss.socket(), disconnected_svr_sock);
-    EXPECT_FALSE(ss.is_writable());
-
-    return true;
-  });
-
-  ASSERT_EQ(0, close(disconnected_svr_sock));
-}
-#endif // #ifndef _WIN32
-
 TEST(TaskQueueTest, IncreaseAtomicInteger) {
   static constexpr unsigned int number_of_tasks{1000000};
   std::atomic_uint count{0};
@@ -7450,6 +7512,6 @@ TEST(UniversalClientImplTest, Ipv6LiteralAddress) {
   std::string ipV6TestURL = "http://[ff06::c3]";
 
   Client cli(ipV6TestURL + ":" + std::to_string(port), CLIENT_CERT_FILE,
-               CLIENT_PRIVATE_KEY_FILE);
+             CLIENT_PRIVATE_KEY_FILE);
   EXPECT_EQ(cli.port(), port);
 }
